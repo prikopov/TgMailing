@@ -41,6 +41,9 @@ def database():
             id INTEGER PRIMARY KEY, created TEXT DEFAULT CURRENT_TIMESTAMP,
             body TEXT NOT NULL, delete_copy INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS preference (
+            name TEXT PRIMARY KEY, value INTEGER NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS account_wait (
             account INTEGER PRIMARY KEY, until REAL NOT NULL
         );
@@ -253,6 +256,9 @@ def update(db, row, **fields):
 async def clean_copy(db, row, client, peer, message_id):
     try:
         await asyncio.wait_for(client.delete_messages(peer, [message_id], revoke=False), 30)
+        remaining = await asyncio.wait_for(client.get_messages(peer, ids=message_id), 30)
+        if remaining is not None:
+            raise ValueError("Сообщение ещё видно в истории отправителя.")
     except Exception as exc:
         if isinstance(exc, FLOOD_ERRORS):
             save_wait(db, row["account"], exc)
@@ -413,6 +419,22 @@ def dark_title_bar(root):
 
 
 
+def paste_shortcut(event):
+    # Windows reports the same virtual key for V under Cyrillic and Latin layouts.
+    if event.keycode == 0x56 or event.keysym.lower() == "v":
+        event.widget.event_generate("<<Paste>>")
+        return "break"
+
+
+def bind_paste_shortcut(parent):
+    for widget in parent.winfo_children():
+        if isinstance(widget, (ttk.Entry, tk.Text)):
+            widget.bind("<Control-KeyPress>", paste_shortcut, add="+")
+        bind_paste_shortcut(widget)
+
+
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -507,18 +529,26 @@ class App:
         ttk.Button(choices, text="Снять выбор", command=lambda: self.recipients.selection_set([])).pack(side="left", padx=6)
         self.recipients.bind("<<TreeviewSelect>>", self.show_selection)
 
-        ttk.Label(composer, text="Текст сообщения", style="Section.TLabel").pack(anchor="w", pady=(8, 3))
+        composer_header = ttk.Frame(composer)
+        composer_header.pack(fill="x", pady=(8, 3))
+        ttk.Label(composer_header, text="Текст сообщения", style="Section.TLabel").pack(side="left")
+        ttk.Button(composer_header, text="Вставить", command=self.paste_body).pack(side="right")
         self.body = tk.Text(composer, height=4, wrap="word", font=("Segoe UI", 11),
                             bg="#101b27", fg="#e5edf6", insertbackground="#e5edf6",
                             selectbackground="#2b4d69", selectforeground="#f0f8ff",
                             padx=10, pady=7, bd=0, highlightthickness=1,
                             highlightbackground="#34495d", highlightcolor="#6eb9ee")
         self.body.pack(fill="x")
+        body_menu = tk.Menu(self.body, tearoff=False, bg="#17232f", fg="#e5edf6",
+                            activebackground="#2b4d69", activeforeground="#f0f8ff")
+        body_menu.add_command(label="Вставить", command=self.paste_body)
+        self.body.bind("<Button-3>", lambda event: body_menu.post(event.x_root, event.y_root))
         bottom = ttk.Frame(composer)
         bottom.pack(fill="x", pady=(8, 0))
-        self.delete_copy = tk.BooleanVar()
-        ttk.Checkbutton(bottom, text="Удалять отправленные сообщения только у себя",
-                        variable=self.delete_copy).pack(side="left")
+        preference = self.db.execute("SELECT value FROM preference WHERE name = 'delete_copy'").fetchone()
+        self.delete_copy = tk.BooleanVar(value=bool(preference["value"]) if preference else True)
+        ttk.Checkbutton(bottom, text="Удалять копии у отправителей после отправки",
+                        variable=self.delete_copy, command=self.save_delete_preference).pack(side="left")
         self.button(bottom, "Запустить рассылку", self.start_campaign, style="Primary.TButton").pack(side="right")
 
         report_top = ttk.Frame(report)
@@ -542,6 +572,16 @@ class App:
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.after(120, self.poll)
         self.load_history()
+        bind_paste_shortcut(root)
+
+    def paste_body(self):
+        self.body.focus_set()
+        self.body.event_generate("<<Paste>>")
+
+    def save_delete_preference(self):
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO preference VALUES ('delete_copy', ?)",
+                            (self.delete_copy.get(),))
 
     def highlight_navigation(self, event=None):
         active = self.tabs.select()
