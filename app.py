@@ -185,6 +185,7 @@ async def scan(folder, credentials, stopped, emit):
         account_name = label
         candidates = set()
         warnings = []
+        contact_summary = ""
         phase = "Подключение"
         try:
             async with connect(path, credentials) as (client, me):
@@ -199,12 +200,19 @@ async def scan(folder, credentials, stopped, emit):
                 except (OSError, errors.RPCError) as exc:
                     warnings.append(f"{phase}: {explain(exc)}")
                 else:
-                    for user in getattr(contacts, "users", ()):
-                        if isinstance(user, types.User) and user.mutual_contact:
-                            row = candidate(user, me, path, False)
-                            if row:
-                                add_candidate(found, row)
-                                candidates.add(user.id)
+                    if isinstance(contacts, types.contacts.Contacts):
+                        entries = {contact.user_id: contact for contact in contacts.contacts}
+                        mutual_ids = {contact.user_id for contact in entries.values() if contact.mutual}
+                        contact_summary = f"Контактов: {len(entries)}, взаимных: {len(mutual_ids)}"
+                        for user in contacts.users:
+                            if isinstance(user, types.User) and user.id in mutual_ids:
+                                row = candidate(user, me, path, False)
+                                if row:
+                                    add_candidate(found, row)
+                                    candidates.add(user.id)
+                    else:
+                        warnings.append("Telegram не вернул список контактов")
+
 
                 phase = "Личные чаты"
                 history_errors = 0
@@ -240,6 +248,8 @@ async def scan(folder, credentials, stopped, emit):
             warnings.append(f"{phase}: {explain(exc)}")
         state = "Остановлено" if stopped.is_set() else "Найдено"
         report = f"{account_name} • {state}: {len(candidates)}"
+        if contact_summary:
+            report += " • " + contact_summary
         if warnings:
             report += " • " + " • ".join(warnings)
         emit("account", (label, report))
