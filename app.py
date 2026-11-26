@@ -182,44 +182,67 @@ async def scan(folder, credentials, stopped, emit):
         if stopped.is_set():
             break
         label = path.name
+        account_name = label
+        candidates = set()
+        warnings = []
+        phase = "Подключение"
         try:
             async with connect(path, credentials) as (client, me):
                 account_name = name(me)
                 emit("account", (label, f"{account_name} • Чтение контактов и чатов"))
-                contacts = await asyncio.wait_for(
-                    client(functions.contacts.GetContactsRequest(hash=0)), 30)
-                people = {u.id: u for u in contacts.users
-                          if isinstance(u, types.User) and u.mutual_contact}
-                incoming = set()
+                phase = "Контакты"
+                try:
+                    contacts = await asyncio.wait_for(
+                        client(functions.contacts.GetContactsRequest(hash=0)), 30)
+                except FLOOD_ERRORS + ACCOUNT_ERRORS:
+                    raise
+                except (OSError, errors.RPCError) as exc:
+                    warnings.append(f"{phase}: {explain(exc)}")
+                else:
+                    for user in getattr(contacts, "users", ()):
+                        if isinstance(user, types.User) and user.mutual_contact:
+                            row = candidate(user, me, path, False)
+                            if row:
+                                add_candidate(found, row)
+                                candidates.add(user.id)
+
+                phase = "Личные чаты"
+                history_errors = 0
+                first_history_error = None
                 async for dialog in client.iter_dialogs():
                     if stopped.is_set():
                         break
                     if not dialog.is_user or not isinstance(dialog.entity, types.User):
                         continue
                     user = dialog.entity
-                    if user.id == me.id or user.bot or user.deleted or user.support:
+                    row = candidate(user, me, path, True)
+                    if not row:
                         continue
-                    # Search by sender to detect inbound messages beyond the latest page.
-                    if dialog.message and not dialog.message.out and dialog.message.sender_id == user.id:
-                        incoming.add(user.id)
-                    else:
-                        history = await asyncio.wait_for(
-                            client.get_messages(user, limit=1, from_user=user), 30)
-                        if history:
-                            incoming.add(user.id)
-                    if user.id in incoming:
-                        people[user.id] = user
-                    row = candidate(user, me, path, user.id in incoming)
-                    if row and user.id in people:
+                    incoming = bool(dialog.message and not dialog.message.out
+                                    and dialog.message.sender_id == user.id)
+                    if not incoming:
+                        try:
+                            incoming = bool(await asyncio.wait_for(
+                                client.get_messages(user, limit=1, from_user=user), 30))
+                        except FLOOD_ERRORS + ACCOUNT_ERRORS:
+                            raise
+                        except (OSError, errors.RPCError, ValueError) as exc:
+                            history_errors += 1
+                            if first_history_error is None:
+                                first_history_error = explain(exc)
+                            continue
+                    if incoming:
                         add_candidate(found, row)
-                for user in people.values():
-                    row = candidate(user, me, path, user.id in incoming)
-                    if row:
-                        add_candidate(found, row)
-                state = "Остановлено" if stopped.is_set() else "Готов"
-                emit("account", (label, f"{account_name} • {state}"))
+                        candidates.add(user.id)
+                if history_errors:
+                    warnings.append(f"Не прочитано чатов: {history_errors}. Первая ошибка: {first_history_error}")
         except Exception as exc:
-            emit("account", (label, explain(exc)))
+            warnings.append(f"{phase}: {explain(exc)}")
+        state = "Остановлено" if stopped.is_set() else "Найдено"
+        report = f"{account_name} • {state}: {len(candidates)}"
+        if warnings:
+            report += " • " + " • ".join(warnings)
+        emit("account", (label, report))
     emit("candidates", sorted(found.values(), key=lambda row: row[1].casefold()))
 
 
@@ -740,7 +763,11 @@ class App:
                     self.rows[key] = row
                     source = "Входящее сообщение" if row[-1] else "Взаимный контакт"
                     self.recipients.insert("", "end", iid=key, values=(row[1], row[3], source))
-                self.status.set(f"Найдено кандидатов: {len(data)}")
+                if data:
+                    self.status.set(f"Найдено кандидатов: {len(data)}. Результаты по сессиям на вкладке «Аккаунты».")
+                else:
+                    self.tabs.select(self.accounts_tab)
+                    self.status.set("Кандидаты не найдены. Проверьте результаты по сессиям на вкладке «Аккаунты».")
             elif kind == "account":
                 key = self.account_rows.get(data[0])
                 if key is None:
