@@ -161,7 +161,7 @@ def explain(exc):
     return f"{type(exc).__name__}: {exc}"
 
 
-def candidate(user, me, path, incoming):
+def candidate(user, me, path):
     if user.id == me.id or user.bot or user.deleted or user.support:
         return None
     try:
@@ -170,7 +170,7 @@ def candidate(user, me, path, incoming):
         return None
     if not isinstance(peer, types.InputPeerUser):
         return None
-    return (user.id, name(user), me.id, name(me), str(path), peer.access_hash, incoming)
+    return (user.id, name(user), me.id, name(me), str(path), peer.access_hash)
 
 
 async def scan(folder, credentials, stopped, emit):
@@ -183,76 +183,30 @@ async def scan(folder, credentials, stopped, emit):
             break
         label = path.name
         account_name = label
-        candidates = set()
-        warnings = []
-        contact_summary = ""
-        phase = "Подключение"
         try:
             async with connect(path, credentials) as (client, me):
                 account_name = name(me)
-                emit("account", (label, f"{account_name} • Чтение контактов и чатов"))
-                phase = "Контакты"
-                try:
-                    contacts = await asyncio.wait_for(
-                        client(functions.contacts.GetContactsRequest(hash=0)), 30)
-                except FLOOD_ERRORS + ACCOUNT_ERRORS:
-                    raise
-                except (OSError, errors.RPCError) as exc:
-                    warnings.append(f"{phase}: {explain(exc)}")
-                else:
-                    if isinstance(contacts, types.contacts.Contacts):
-                        entries = {contact.user_id: contact for contact in contacts.contacts}
-                        mutual_ids = {contact.user_id for contact in entries.values() if contact.mutual}
-                        contact_summary = f"Контактов: {len(entries)}, взаимных: {len(mutual_ids)}"
-                        for user in contacts.users:
-                            if isinstance(user, types.User) and user.id in mutual_ids:
-                                row = candidate(user, me, path, False)
-                                if row:
-                                    add_candidate(found, row)
-                                    candidates.add(user.id)
-                    else:
-                        warnings.append("Telegram не вернул список контактов")
+                emit("account", (label, f"{account_name} • Чтение сохранённых контактов"))
+                contacts = await asyncio.wait_for(
+                    client(functions.contacts.GetContactsRequest(hash=0)), 30)
+                if not isinstance(contacts, types.contacts.Contacts):
+                    raise ValueError("Telegram не вернул список контактов")
 
-
-                phase = "Личные чаты"
-                history_errors = 0
-                first_history_error = None
-                async for dialog in client.iter_dialogs():
+                saved_ids = {contact.user_id for contact in contacts.contacts}
+                eligible = set()
+                for user in contacts.users:
                     if stopped.is_set():
                         break
-                    if not dialog.is_user or not isinstance(dialog.entity, types.User):
-                        continue
-                    user = dialog.entity
-                    row = candidate(user, me, path, True)
-                    if not row:
-                        continue
-                    incoming = bool(dialog.message and not dialog.message.out
-                                    and dialog.message.sender_id == user.id)
-                    if not incoming:
-                        try:
-                            incoming = bool(await asyncio.wait_for(
-                                client.get_messages(user, limit=1, from_user=user), 30))
-                        except FLOOD_ERRORS + ACCOUNT_ERRORS:
-                            raise
-                        except (OSError, errors.RPCError, ValueError) as exc:
-                            history_errors += 1
-                            if first_history_error is None:
-                                first_history_error = explain(exc)
-                            continue
-                    if incoming:
-                        add_candidate(found, row)
-                        candidates.add(user.id)
-                if history_errors:
-                    warnings.append(f"Не прочитано чатов: {history_errors}. Первая ошибка: {first_history_error}")
+                    if isinstance(user, types.User) and user.id in saved_ids:
+                        row = candidate(user, me, path)
+                        if row:
+                            found.setdefault(user.id, row)
+                            eligible.add(user.id)
+                state = "Остановлено" if stopped.is_set() else "Готово"
+                emit("account", (label, f"{account_name} • {state} • "
+                                 f"Сохранено в Telegram: {len(saved_ids)}, доступно: {len(eligible)}"))
         except Exception as exc:
-            warnings.append(f"{phase}: {explain(exc)}")
-        state = "Остановлено" if stopped.is_set() else "Найдено"
-        report = f"{account_name} • {state}: {len(candidates)}"
-        if contact_summary:
-            report += " • " + contact_summary
-        if warnings:
-            report += " • " + " • ".join(warnings)
-        emit("account", (label, report))
+            emit("account", (label, f"{account_name} • {explain(exc)}"))
     emit("candidates", sorted(found.values(), key=lambda row: row[1].casefold()))
 
 
@@ -271,12 +225,6 @@ async def check_proxy(paths, credentials, stopped, emit):
         except Exception as exc:
             emit("account", (label, f"Проверка SOCKS5: {explain(exc)}"))
     emit("note", f"Подключение через SOCKS5 подтверждено для {successes} из {checked}. Подробнее на вкладке «Аккаунты».")
-
-
-def add_candidate(found, row):
-    previous = found.get(row[0])
-    if previous is None or (row[-1] and not previous[-1]):
-        found[row[0]] = row
 
 
 def update(db, row, **fields):
@@ -725,7 +673,7 @@ class App:
             self.db.executemany("""INSERT INTO delivery
                 (campaign, recipient, name, account, sender, session, access_hash, status)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                [(campaign_id, *row[:-1], PENDING) for row in selected])
+                [(campaign_id, *row, PENDING) for row in selected])
         self.load_history(campaign_id)
         self.tabs.select(self.report_tab)
         self.start(run_campaign(campaign_id, credentials, self.stopped, self.emit, False), "Отправка")
@@ -771,8 +719,7 @@ class App:
                 for row in data:
                     key = str(row[0])
                     self.rows[key] = row
-                    source = "Входящее сообщение" if row[-1] else "Взаимный контакт"
-                    self.recipients.insert("", "end", iid=key, values=(row[1], row[3], source))
+                    self.recipients.insert("", "end", iid=key, values=(row[1], row[3], "Сохранённый контакт"))
                 if data:
                     self.status.set(f"Найдено кандидатов: {len(data)}. Результаты по сессиям на вкладке «Аккаунты».")
                 else:
